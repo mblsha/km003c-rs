@@ -345,7 +345,7 @@ impl KM003C {
             device_info.device_address()
         );
 
-        let device = device_info.open().await?;
+        let mut device = device_info.open().await?;
 
         // Optionally reset device (skip on MacOS if having issues)
         if !config.skip_reset {
@@ -354,6 +354,12 @@ impl KM003C {
             // CRITICAL: Device needs 1.5 seconds to fully initialize after reset
             // (validated through protocol research - 100ms is insufficient for AdcQueue)
             tokio::time::sleep(Duration::from_millis(1500)).await;
+            // Re-enumerate and reopen after reset (old handle may be invalid).
+            let device_info = nusb::list_devices()
+                .await?
+                .find(|d| d.vendor_id() == VID && d.product_id() == PID)
+                .ok_or(KMError::DeviceNotFound)?;
+            device = device_info.open().await?;
         } else {
             debug!("Skipping USB reset (skip_reset=true)");
         }
@@ -733,19 +739,25 @@ impl KM003C {
         const MAX_CONNECT_RETRIES: u8 = 3;
         let mut last_error = None;
         for attempt in 1..=MAX_CONNECT_RETRIES {
-            self.send(Packet::Connect).await?;
-            match self.receive().await? {
-                Packet::Accept { .. } => {
-                    last_error = None;
-                    break;
-                }
-                other => {
-                    last_error = Some(format!("Expected Accept for Connect, got {:?}", other));
-                    if attempt < MAX_CONNECT_RETRIES {
-                        debug!("Connect attempt {} failed, retrying...", attempt);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Err(err) = self.send(Packet::Connect).await {
+                last_error = Some(format!("Connect send failed: {err:?}"));
+            } else {
+                match self.receive().await {
+                    Ok(Packet::Accept { .. }) => {
+                        last_error = None;
+                        break;
+                    }
+                    Ok(other) => {
+                        last_error = Some(format!("Expected Accept for Connect, got {:?}", other));
+                    }
+                    Err(err) => {
+                        last_error = Some(format!("Connect receive failed: {err:?}"));
                     }
                 }
+            }
+            if attempt < MAX_CONNECT_RETRIES {
+                debug!("Connect attempt {} failed, retrying...", attempt);
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         if let Some(err) = last_error {
